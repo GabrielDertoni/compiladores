@@ -1,4 +1,7 @@
 mod impls;
+pub mod node_id;
+
+pub use node_id::NodeId;
 
 pub type Program = Vec<Stmt>;
 
@@ -11,9 +14,10 @@ pub enum Stmt {
 
 #[derive(Debug, Clone)]
 pub struct TypeDef {
+    pub id: NodeId,
     pub name: Ident,
     pub is_alias: bool,
-    pub generic: Vec<Variable>,
+    pub generics: Vec<Variable>,
     pub structural_type: Box<Type>,
 }
 
@@ -26,11 +30,13 @@ pub enum Type {
     TagUnion(TagUnionDef),
     /// Structure, like `{ field: Type }`
     Structure(StructureDef),
+    /// Function type, like `Int -> String`
+    Fn(FnType),
 }
 
 #[derive(Debug, Clone)]
 pub struct TypeRef {
-    pub ty: Box<Type>,
+    pub name: Ident,
     pub generic_args: Vec<GenericArg>,
 }
 
@@ -53,13 +59,19 @@ pub struct TagDef {
 
 #[derive(Debug, Clone)]
 pub struct StructureDef {
-    pub field: Vec<StructureFieldDef>,
+    pub fields: Vec<StructureFieldDef>,
 }
 
 #[derive(Debug, Clone)]
 pub struct StructureFieldDef {
     pub field: Ident,
     pub ty: Box<Type>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FnType {
+    pub arg_ty: Box<Type>,
+    pub ret_ty: Box<Type>,
 }
 
 #[derive(Debug, Clone)]
@@ -87,8 +99,7 @@ pub enum ExprKind {
 pub struct FnExpr {
     pub id: NodeId,
     pub arg: Ident,
-    pub arg_ty: Box<Type>,
-    pub ret_ty: Box<Type>,
+    pub ty: Box<Type>,
 }
 
 #[derive(Debug, Clone)]
@@ -229,6 +240,8 @@ pub struct ReturnExpr {
 #[derive(Debug, Clone)]
 pub struct Decl {
     pub is_const: bool,
+    // TODO: Support any `Type` instead
+    pub ty: Box<TypeRef>,
     pub name: Ident,
     pub value: Expr,
 }
@@ -236,9 +249,5 @@ pub struct Decl {
 #[derive(Debug, Clone)]
 pub struct Variable(Ident);
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Ident(String);
-
-/// Uniquely identifies the AST node in the compiler tables
-#[derive(Debug, Clone)]
-pub struct NodeId(u64);

@@ -1,5 +1,7 @@
 //! Impls for AST types
 
+use std::borrow::Borrow;
+
 use crate::*;
 
 impl BinOp {
@@ -18,5 +20,23 @@ impl BinOp {
             And => 11,
             Or => 12,
         }
+    }
+}
+
+impl From<String> for Ident {
+    fn from(value: String) -> Self {
+        Ident(value)
+    }
+}
+
+impl From<&str> for Ident {
+    fn from(value: &str) -> Self {
+        Ident(value.to_string())
+    }
+}
+
+impl Borrow<str> for Ident {
+    fn borrow(&self) -> &str {
+        self.0.as_str()
     }
 }
