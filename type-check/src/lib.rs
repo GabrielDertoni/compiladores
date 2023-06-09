@@ -22,17 +22,21 @@ impl Scope {
 // Very inspired by https://doc.rust-lang.org/nightly/nightly-rustc/rustc_middle/ty/struct.TyCtxt.html
 pub struct TyCx {
     types: HashMap<ast::Ident, (ast::TypeDef, Scope)>,
-    variables: HashMap<ast::Ident, (ast::TypeRef, Scope)>,
+    variables: HashMap<ast::Ident, (ast::Type, Scope)>,
     curr_scope: Scope,
 }
 
 impl TyCx {
     pub fn new() -> Self {
-        TyCx {
+        let mut tcx = TyCx {
             types: HashMap::new(),
             variables: HashMap::new(),
             curr_scope: Scope(0),
+        };
+        for ty in BUILTIN_TYPES {
+            tcx.add_type_def(ty.def());
         }
+        tcx
     }
 
     pub fn scope<T>(&mut self, cont: impl FnOnce(&mut Self) -> T) -> T {
@@ -47,7 +51,15 @@ impl TyCx {
         ret
     }
 
-    pub fn lookup_var<'a, Q>(&'a self, name: &Q) -> Result<&'a ast::TypeRef>
+    pub fn lookup_type(&self, name: &ast::Ident) -> Result<&ast::TypeDef> {
+        if let Some((ty_def, _scope)) = self.types.get(name) {
+            Ok(ty_def)
+        } else {
+            Err(Error::UndefinedType(name.to_owned()))
+        }
+    }
+
+    pub fn lookup_var<'a, Q>(&'a self, name: &Q) -> Result<&'a ast::Type>
     where
         ast::Ident: Borrow<Q>,
         Q: Into<ast::Ident> + Clone + Eq + Hash,
@@ -58,18 +70,15 @@ impl TyCx {
             .ok_or_else(|| Error::UndefinedVar(name.clone().into()))
     }
 
-    pub fn add_var(&mut self, name: &ast::Ident, ty: &ast::TypeRef) -> Result<()> {
-        self.check_type_ref(ty)?;
+    pub fn add_var(&mut self, name: &ast::Ident, ty: &ast::Type) -> Result<()> {
+        self.check_type(ty)?;
         self.variables
             .insert(name.clone(), (ty.clone(), self.curr_scope));
         Ok(())
     }
 
-    pub fn add_type_def(&mut self, def: &ast::TypeDef) -> Result<()> {
-        self.check_type_def(def)?;
-        self.types
-            .insert(def.name.clone(), (def.clone(), self.curr_scope));
-        Ok(())
+    pub fn add_type_def(&mut self, def: ast::TypeDef) {
+        self.types.insert(def.name.clone(), (def, self.curr_scope));
     }
 
     pub fn check_expr(&mut self, expr: &ast::Expr) -> Result<ast::Type> {
@@ -90,20 +99,21 @@ impl TyCx {
         self.scope(|tcx| {
             tcx.add_var(&expr.arg, &expr.ty.argument)?;
             let actual_ret_type = tcx.check_block_expr(&expr.body)?;
-            let ret_ty = tcx.deref_type(&expr.ty.ret)?;
-            tcx.assert_same_type(&actual_ret_type, &ret_ty)?;
+            tcx.assert_same_type(&actual_ret_type, &expr.ty.ret)?;
             Ok(())
         })?;
         Ok(ast::Type::Fn(expr.ty.clone()))
     }
 
     pub fn check_block_expr(&mut self, expr: &ast::BlockExpr) -> Result<ast::Type> {
-        let ret_type = None;
+        let mut ret_type = None;
         for stmt in &expr.stmts {
             if let ast::Stmt::Return(ret) = stmt {
                 let ty = self.check_expr(&ret.expr)?;
                 if let Some(ret_type) = ret_type.as_ref() {
                     self.assert_same_type(ret_type, &ty)?;
+                } else {
+                    ret_type.replace(ty);
                 }
             } else {
                 self.check_stmt(stmt)?;
@@ -150,15 +160,25 @@ impl TyCx {
 
     pub fn check_match_expr(&mut self, expr: &ast::MatchExpr) -> Result<ast::Type> {
         let scrutinee_ty = self.check_expr(&expr.scrutinee)?;
-        let ty = None;
+        let mut ty = None;
         for arm in &expr.arms {
-            self.check_pattern(&arm.pattern, &scrutinee_ty)?;
-            let expr_ty = self.check_expr(&arm.expr)?;
+            let expr_ty = self.check_match_arm(&arm, &scrutinee_ty)?;
             if let Some(ty) = ty.as_ref() {
                 self.assert_same_type(&expr_ty, ty)?;
+            } else {
+                ty.replace(expr_ty);
             }
         }
         ty.ok_or_else(|| Error::EmptyMatch)
+    }
+
+    pub fn check_match_arm(
+        &mut self,
+        arm: &ast::MatchArm,
+        scrutinee_ty: &ast::Type,
+    ) -> Result<ast::Type> {
+        self.check_pattern(&arm.pattern, &scrutinee_ty)?;
+        self.check_expr(&arm.expr)
     }
 
     fn check_call_expr(&mut self, expr: &ast::CallExpr) -> Result<ast::Type> {
@@ -168,18 +188,15 @@ impl TyCx {
             otherwise => return Err(Error::ExpectedFnType(otherwise)),
         };
         let arg_ty = self.check_expr(&expr.arg)?;
-        let expected_arg_ty = self.deref_type(&fn_ty.argument)?;
-        self.assert_same_type(&expected_arg_ty, &arg_ty)?;
-        self.deref_type(&fn_ty.ret).map(ToOwned::to_owned)
+        self.assert_same_type(&fn_ty.argument, &arg_ty)?;
+        Ok(*fn_ty.ret)
     }
 
     fn check_access_expr(&mut self, expr: &ast::AccessExpr) -> Result<ast::Type> {
         let mut struct_ty = self.check_expr(&expr.value)?;
         loop {
             match struct_ty {
-                ast::Type::Ref(ty_ref) => {
-                    struct_ty = self.deref_type(&ty_ref).map(ToOwned::to_owned)?
-                }
+                ast::Type::Ref(ty_ref) => struct_ty = self.deref_type(&ty_ref)?,
                 ast::Type::TagUnion(_) | ast::Type::Fn(_) => {
                     return Err(Error::InvalidAccess(struct_ty, expr.field.to_owned()))
                 }
@@ -204,14 +221,14 @@ impl TyCx {
     }
 
     fn check_ref_expr(&self, expr: &ast::RefExpr) -> Result<ast::Type> {
-        let ty = self.lookup_var(&expr.ident)?;
-        self.deref_type(ty).map(ToOwned::to_owned)
+        self.lookup_var(&expr.ident).map(ToOwned::to_owned)
     }
 
-    fn check_literal_expr(&self, expr: &ast::LiteralExpr) -> Result<ast::Type> {
+    fn check_literal_expr(&self, expr: &ast::Literal) -> Result<ast::Type> {
         match expr {
-            ast::LiteralExpr::String(_) => Ok(ast::Type::string()),
-            ast::LiteralExpr::Number(_) => Ok(ast::Type::number()),
+            ast::Literal::String(_) => Ok(ast::Type::string()),
+            ast::Literal::Number(_) => Ok(ast::Type::number()),
+            ast::Literal::Bool(_) => Ok(ast::Type::bool()),
         }
     }
 
@@ -251,7 +268,21 @@ impl TyCx {
             (ast::Pattern::Tag(patt), ast::Type::TagUnion(expected)) => {
                 self.check_tag_pattern(patt, expected)
             }
-            (ast::Pattern::Catchall, _) => Ok(()),
+            (ast::Pattern::Literal(lit_pat), ast::Type::Ref(expected)) => {
+                let Some(builtin) = BuiltinType::from_name(&expected.name.0) else {
+                    return Err(Error::ExpectedBuiltinType(expected.to_owned().into()))
+                };
+                match (lit_pat, builtin) {
+                    (ast::Literal::String(_), BuiltinType::String)
+                    | (ast::Literal::Number(_), BuiltinType::Number)
+                    | (ast::Literal::Bool(_), BuiltinType::Bool) => Ok(()),
+                    (pat, builtin) => Err(Error::IncompatiblePattern(
+                        pat.to_owned().into(),
+                        builtin.into(),
+                    )),
+                }
+            }
+            (ast::Pattern::Catchall(_), _) => Ok(()),
             (patt, expected) => Err(Error::IncompatiblePattern(
                 patt.to_owned(),
                 expected.to_owned(),
@@ -312,9 +343,11 @@ impl TyCx {
     }
 
     fn check_decl(&mut self, decl: &ast::Decl) -> Result<()> {
+        self.check_type(&decl.ty)?;
+        self.add_var(&decl.name, &decl.ty)?;
         let ty = self.check_expr(&decl.value)?;
-        self.assert_same_type(&ty, self.deref_type(decl.ty.as_ref())?)?;
-        self.add_var(&decl.name, &decl.ty)
+        self.assert_same_type(&ty, decl.ty.as_ref())?;
+        Ok(())
     }
 
     fn check_return_stmt(&mut self, ret: &ast::ReturnStmt) -> Result<()> {
@@ -322,8 +355,10 @@ impl TyCx {
         Ok(())
     }
 
-    pub fn check_type_def(&self, def: &ast::TypeDef) -> Result<()> {
-        self.check_type(&def.structural_type)
+    pub fn check_type_def(&mut self, def: &ast::TypeDef) -> Result<()> {
+        self.check_type(&def.structural_type)?;
+        self.add_type_def(def.clone());
+        Ok(())
     }
 
     pub fn check_type(&self, ty: &ast::Type) -> Result<()> {
@@ -340,8 +375,8 @@ impl TyCx {
                 }
             }
             ast::Type::Fn(fn_ty) => {
-                self.check_type_ref(&fn_ty.argument)?;
-                self.check_type_ref(&fn_ty.ret)?;
+                self.check_type(&fn_ty.argument)?;
+                self.check_type(&fn_ty.ret)?;
             }
         }
         Ok(())
@@ -362,9 +397,14 @@ impl TyCx {
         // TODO: Check generics
         // TODO: Allow recursive types and refer to types before they are mentioned.
         if !self.types.contains_key(&ty_ref.name) {
-            return Err(Error::UndefinedType(ty_ref.name.clone()));
-        };
-        Ok(())
+            if BuiltinType::from_name(&ty_ref.name.0).is_some() {
+                Ok(())
+            } else {
+                Err(Error::UndefinedType(ty_ref.name.clone()))
+            }
+        } else {
+            Ok(())
+        }
     }
 
     fn assert_same_type(&self, lhs: &ast::Type, rhs: &ast::Type) -> Result<()> {
@@ -380,14 +420,15 @@ impl TyCx {
 
     fn type_eq(&self, lhs: &ast::Type, rhs: &ast::Type) -> Result<bool> {
         match (lhs, rhs) {
-            (ast::Type::Ref(lhs), rhs) => {
-                let lhs = self.deref_type(lhs)?;
-                self.type_eq(lhs, rhs)
-            }
-            (_, ast::Type::Ref(rhs)) => {
-                let rhs = self.deref_type(rhs)?;
-                self.type_eq(lhs, rhs)
-            }
+            // (ast::Type::Ref(lhs), rhs) => {
+            //     let lhs = self.lookup_type(lhs)?;
+            //     self.type_eq(&lhs, rhs)
+            // }
+            // (_, ast::Type::Ref(rhs)) => {
+            //     let rhs = self.deref_type(rhs)?;
+            //     self.type_eq(lhs, &rhs)
+            // }
+            (ast::Type::Ref(lhs), ast::Type::Ref(rhs)) => Ok(lhs.name == rhs.name),
             (ast::Type::Structure(lhs), ast::Type::Structure(rhs)) => {
                 // Structural equality
 
@@ -418,18 +459,25 @@ impl TyCx {
                 }
                 Ok(true)
             }
+            (ast::Type::Fn(lhs), ast::Type::Fn(rhs)) => Ok(self
+                .type_eq(&lhs.argument, &rhs.argument)?
+                && self.type_eq(&lhs.ret, &rhs.ret)?),
             _ => return Ok(false),
         }
     }
 
-    fn deref_type(&self, ty_ref: &ast::TypeRef) -> Result<&ast::Type> {
-        if let Some((ty_def, _scope)) = self.types.get(&ty_ref.name) {
-            Ok(ty_def.structural_type.as_ref())
-        } else {
-            Err(Error::UndefinedType(ty_ref.name.to_owned()))
-        }
+    fn deref_type(&self, ty_ref: &ast::TypeRef) -> Result<ast::Type> {
+        let ty_def = self.lookup_type(&ty_ref.name)?;
+        Ok(ty_def.structural_type.as_ref().to_owned())
     }
 }
+
+const BUILTIN_TYPES: &'static [BuiltinType] = &[
+    BuiltinType::String,
+    BuiltinType::Unit,
+    BuiltinType::Number,
+    BuiltinType::Bool,
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum BuiltinType {
@@ -439,17 +487,45 @@ pub enum BuiltinType {
     Bool,
 }
 
+impl BuiltinType {
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "Unit" => Some(BuiltinType::Unit),
+            "String" => Some(BuiltinType::String),
+            "Number" => Some(BuiltinType::Number),
+            "Bool" => Some(BuiltinType::Bool),
+            _ => None,
+        }
+    }
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            BuiltinType::String => "String",
+            BuiltinType::Unit => "Unit",
+            BuiltinType::Number => "Number",
+            BuiltinType::Bool => "Bool",
+        }
+    }
+
+    pub fn def(&self) -> ast::TypeDef {
+        ast::TypeDef {
+            id: 0.into(),
+            name: self.name().into(),
+            is_alias: false,
+            generics: Vec::new(),
+            structural_type: Box::new(self.to_owned().into()),
+        }
+    }
+}
+
 impl TryFrom<ast::Type> for BuiltinType {
     type Error = Error;
 
     fn try_from(value: ast::Type) -> Result<Self> {
         if let ast::Type::Ref(ty_ref) = &value {
-            match ty_ref.name.0.as_str() {
-                "Unit" => Ok(BuiltinType::Unit),
-                "String" => Ok(BuiltinType::String),
-                "Number" => Ok(BuiltinType::Number),
-                "Bool" => Ok(BuiltinType::Bool),
-                _ => Err(Error::ExpectedBuiltinType(value)),
+            match BuiltinType::from_name(ty_ref.name.0.as_str()) {
+                Some(ty) => Ok(ty),
+                None => Err(Error::ExpectedBuiltinType(value)),
             }
         } else {
             Err(Error::ExpectedBuiltinType(value))
@@ -482,10 +558,158 @@ pub enum Error {
 
     /// # Example
     ///
-    /// ```
+    /// ```ignore
     /// if ({ a: "hello" }) is {
     ///     { b } => print(b),
     /// }
     /// ```
     IncompatiblePattern(ast::Pattern, ast::Type),
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    pub fn fib() {
+        // ```
+        //  1 | const fib: Number -> Number = fn n : Number -> Number {
+        //  2 |     return if n is {
+        //  3 |         0 => 1,
+        //  4 |         1 => 1,
+        //  5 |         n => fib (n-1) + fib (n-2),
+        //  6 |     };
+        //  7 | }
+        // ```
+        let code = {
+            use ast::*;
+
+            let line_5 = Expr {
+                id: 8.into(),
+                kind: Box::new(ExprKind::Bin(BinExpr {
+                    op: BinOp::Add,
+                    lhs: Expr {
+                        id: 9.into(),
+                        kind: Box::new(ExprKind::Call(CallExpr {
+                            callee: Expr {
+                                id: 10.into(),
+                                kind: Box::new(ExprKind::Ref(RefExpr {
+                                    ident: "fib".into(),
+                                })),
+                            },
+                            arg: Expr {
+                                id: 11.into(),
+                                kind: Box::new(ExprKind::Bin(BinExpr {
+                                    op: BinOp::Sub,
+                                    lhs: Expr {
+                                        id: 12.into(),
+                                        kind: Box::new(ExprKind::Ref(RefExpr {
+                                            ident: "n".into(),
+                                        })),
+                                    },
+                                    rhs: Expr {
+                                        id: 13.into(),
+                                        kind: Box::new(ExprKind::Literal(Literal::Number(1.))),
+                                    },
+                                })),
+                            },
+                        })),
+                    },
+                    rhs: Expr {
+                        id: 14.into(),
+                        kind: Box::new(ExprKind::Call(CallExpr {
+                            callee: Expr {
+                                id: 15.into(),
+                                kind: Box::new(ExprKind::Ref(RefExpr {
+                                    ident: "fib".into(),
+                                })),
+                            },
+                            arg: Expr {
+                                id: 16.into(),
+                                kind: Box::new(ExprKind::Bin(BinExpr {
+                                    op: BinOp::Sub,
+                                    lhs: Expr {
+                                        id: 17.into(),
+                                        kind: Box::new(ExprKind::Ref(RefExpr {
+                                            ident: "n".into(),
+                                        })),
+                                    },
+                                    rhs: Expr {
+                                        id: 18.into(),
+                                        kind: Box::new(ExprKind::Literal(Literal::Number(2.))),
+                                    },
+                                })),
+                            },
+                        })),
+                    },
+                })),
+            };
+
+            Stmt::Decl(Decl {
+                is_const: true,
+                ty: Box::new(Type::Fn(FnType {
+                    argument: Box::new(Type::number()),
+                    ret: Box::new(Type::number()),
+                })),
+                name: "fib".into(),
+                value: Expr {
+                    id: 1.into(),
+                    kind: Box::new(ExprKind::Fn(FnExpr {
+                        id: 2.into(),
+                        arg: "n".into(),
+                        ty: FnType {
+                            argument: Box::new(Type::number()),
+                            ret: Box::new(Type::number()),
+                        },
+                        body: BlockExpr {
+                            id: 3.into(),
+                            stmts: [Stmt::Return(ReturnStmt {
+                                expr: Expr {
+                                    id: 4.into(),
+                                    kind: Box::new(ExprKind::Match(MatchExpr {
+                                        scrutinee: Expr {
+                                            id: 5.into(),
+                                            kind: Box::new(ExprKind::Ref(RefExpr {
+                                                ident: "n".into(),
+                                            })),
+                                        },
+                                        arms: [
+                                            MatchArm {
+                                                pattern: Pattern::Literal(Literal::Number(0.)),
+                                                expr: Expr {
+                                                    id: 6.into(),
+                                                    kind: Box::new(ExprKind::Literal(
+                                                        Literal::Number(1.),
+                                                    )),
+                                                },
+                                            },
+                                            MatchArm {
+                                                pattern: Pattern::Literal(Literal::Number(1.)),
+                                                expr: Expr {
+                                                    id: 7.into(),
+                                                    kind: Box::new(ExprKind::Literal(
+                                                        Literal::Number(1.),
+                                                    )),
+                                                },
+                                            },
+                                            MatchArm {
+                                                pattern: Pattern::Catchall("n".into()),
+                                                expr: line_5,
+                                            },
+                                        ]
+                                        .to_vec(),
+                                    })),
+                                },
+                            })]
+                            .to_vec(),
+                        },
+                    })),
+                },
+            })
+        };
+
+        let mut tcx = TyCx::new();
+        let res = tcx.check_stmt(&code);
+        assert!(res.is_ok(), "{res:?}");
+    }
 }

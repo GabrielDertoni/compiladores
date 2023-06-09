@@ -115,6 +115,12 @@ impl From<TagPattern> for Pattern {
     }
 }
 
+impl From<Literal> for Pattern {
+    fn from(value: Literal) -> Self {
+        Pattern::Literal(value)
+    }
+}
+
 impl From<String> for Ident {
     fn from(value: String) -> Self {
         Ident(value)

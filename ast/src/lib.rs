@@ -72,15 +72,14 @@ pub struct StructureFieldDef {
 
 #[derive(Debug, Clone)]
 pub struct FnType {
-    // TODO: Make this accept any `Type`
-    pub argument: TypeRef,
-    pub ret: TypeRef,
+    pub argument: Box<Type>,
+    pub ret: Box<Type>,
 }
 
 #[derive(Debug, Clone)]
 pub struct Expr {
-    pub kind: Box<ExprKind>,
     pub id: NodeId,
+    pub kind: Box<ExprKind>,
 }
 
 // Always boxed
@@ -93,7 +92,7 @@ pub enum ExprKind {
     Call(CallExpr),
     Access(AccessExpr),
     Ref(RefExpr),
-    Literal(LiteralExpr),
+    Literal(Literal),
     Bin(BinExpr),
 }
 
@@ -150,7 +149,8 @@ pub struct MatchArm {
 pub enum Pattern {
     Structure(StructurePattern),
     Tag(TagPattern),
-    Catchall,
+    Literal(Literal),
+    Catchall(Ident),
 }
 
 #[derive(Debug, Clone)]
@@ -184,9 +184,10 @@ pub struct RefExpr {
 }
 
 #[derive(Debug, Clone)]
-pub enum LiteralExpr {
+pub enum Literal {
     String(String),
     Number(f64),
+    Bool(bool),
 }
 
 #[derive(Debug, Clone)]
@@ -243,8 +244,7 @@ pub struct ReturnStmt {
 #[derive(Debug, Clone)]
 pub struct Decl {
     pub is_const: bool,
-    // TODO: Support any `Type` instead
-    pub ty: Box<TypeRef>,
+    pub ty: Box<Type>,
     pub name: Ident,
     pub value: Expr,
 }
