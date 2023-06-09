@@ -10,6 +10,8 @@ pub enum Stmt {
     TypeDef(TypeDef),
     Expr(Expr),
     Decl(Decl),
+    // TODO: Make this an expression
+    Return(ReturnStmt),
 }
 
 #[derive(Debug, Clone)]
@@ -70,8 +72,9 @@ pub struct StructureFieldDef {
 
 #[derive(Debug, Clone)]
 pub struct FnType {
-    pub arg_ty: Box<Type>,
-    pub ret_ty: Box<Type>,
+    // TODO: Make this accept any `Type`
+    pub argument: TypeRef,
+    pub ret: TypeRef,
 }
 
 #[derive(Debug, Clone)]
@@ -92,14 +95,14 @@ pub enum ExprKind {
     Ref(RefExpr),
     Literal(LiteralExpr),
     Bin(BinExpr),
-    Return(ReturnExpr),
 }
 
 #[derive(Debug, Clone)]
 pub struct FnExpr {
     pub id: NodeId,
     pub arg: Ident,
-    pub ty: Box<Type>,
+    pub ty: FnType,
+    pub body: BlockExpr,
 }
 
 #[derive(Debug, Clone)]
@@ -233,7 +236,7 @@ pub enum BinOp {
 }
 
 #[derive(Debug, Clone)]
-pub struct ReturnExpr {
+pub struct ReturnStmt {
     pub expr: Expr,
 }
 
@@ -247,7 +250,7 @@ pub struct Decl {
 }
 
 #[derive(Debug, Clone)]
-pub struct Variable(Ident);
+pub struct Variable(pub Ident);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct Ident(String);
+pub struct Ident(pub String);

@@ -101,3 +101,69 @@ type Result t e = [ Ok t, Err e ];
 type MyError = alias [ FileError, NetworkError, ParsingError ];
 type MyResult = Result U32 MyError;
 ```
+
+
+```rust
+pub enum Token {
+    RParen,
+    LParen,
+    Dot,
+    Plus,
+    Error,
+}
+
+pub struct Lexer;
+
+impl Iterator for Lexer {
+    type Item = Token;
+
+    fn next(&mut self) -> Option<Token> {
+        // PATO
+        todo!()
+    }
+}
+```
+
+```rust
+pub struct Parser {
+    lexer: Lexer,
+}
+
+impl Parser {
+    pub fn new(lexer: Lexer) -> Self {
+        todo!();
+    }
+
+    pub fn parse_program(&mut self) -> Result<Program, Error> {
+        let mut stmts = Vec::new();
+        while !self.eof() {
+            stmts.push(self.parse_stmt()?);
+        }
+        Ok(stmts)
+    }
+
+    pub fn parse_stmt(&mut self) -> Result<Stmt, Error> {
+        if let Ok(type_def) = self.parse_type_def() {
+            Ok(Stmt::TypeDef(type_def))
+        } else if let Ok(expr) = self.parse_expr() {
+            Ok(Stmt::Expr(expr))
+        } else if let Ok(decl) = self.parse_decl() {
+            Ok(Stmt::Decl(decl))
+        } else if let Ok(ret) = self.parse_return_stmt() {
+            Ok(Stmt::Return(ret))
+        } else {
+            Err(Error::ExpectedStmt)
+        }
+    }
+
+    pub fn parse_type_def(&mut self) -> Result<TypeDef, Error> {
+        Ok(TypeDef {
+            id: self.next_node_id(),
+            name: self.parse_ident()?,
+            is_alias: ,
+            generics: parse_many(|| self.parse_variable())?,
+            structural_type: Box::new(self.parse_type()?),
+        })
+    }
+}
+```
