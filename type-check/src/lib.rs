@@ -6,32 +6,34 @@ use std::{borrow::Borrow, collections::HashMap, hash::Hash};
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Scope(usize);
+#[derive(Debug, Clone, Default)]
+pub struct Scope {
+    /// Types defined in this scope
+    types: HashMap<ast::Ident, ast::TypeDef>,
+    /// Variables defined in this scope
+    variables: HashMap<ast::Ident, ast::Type>,
+}
 
 impl Scope {
-    pub fn enter(&mut self) {
-        self.0 += 1;
-    }
-
-    pub fn exit(&mut self) {
-        self.0 -= 1;
+    pub fn new() -> Self {
+        Scope {
+            types: HashMap::new(),
+            variables: HashMap::new(),
+        }
     }
 }
 
 // Very inspired by https://doc.rust-lang.org/nightly/nightly-rustc/rustc_middle/ty/struct.TyCtxt.html
 pub struct TyCx {
-    types: HashMap<ast::Ident, (ast::TypeDef, Scope)>,
-    variables: HashMap<ast::Ident, (ast::Type, Scope)>,
-    curr_scope: Scope,
+    scopes: Vec<Scope>,
+    type_cache: HashMap<ast::NodeId, ast::Type>,
 }
 
 impl TyCx {
     pub fn new() -> Self {
         let mut tcx = TyCx {
-            types: HashMap::new(),
-            variables: HashMap::new(),
-            curr_scope: Scope(0),
+            scopes: vec![Scope::new()],
+            type_cache: HashMap::new(),
         };
         for ty in BUILTIN_TYPES {
             tcx.add_type_def(ty.def());
@@ -39,24 +41,36 @@ impl TyCx {
         tcx
     }
 
+    pub fn type_of_tag(&self, tag: &ast::Ident) -> Result<ast::TagUnionDef> {
+        self.scopes
+            .iter()
+            .rev()
+            .flat_map(|scope| scope.types.values())
+            .find_map(|ty| {
+                if let ast::Type::TagUnion(tags) = ty.structural_type.as_ref() {
+                    if tags.variants.iter().find(|var| &var.name == tag).is_some() {
+                        return Some(tags.to_owned());
+                    }
+                }
+                None
+            })
+            .ok_or_else(|| Error::TagNotFound(tag.to_owned()))
+    }
+
     pub fn scope<T>(&mut self, cont: impl FnOnce(&mut Self) -> T) -> T {
-        self.curr_scope.enter();
+        self.scopes.push(Scope::new());
         let ret = cont(self);
-        // Remove everything added for the exited scope
-        self.curr_scope.exit();
-        self.types
-            .retain(|_, &mut (_, scope)| scope <= self.curr_scope);
-        self.variables
-            .retain(|_, &mut (_, scope)| scope <= self.curr_scope);
+        self.scopes.pop();
         ret
     }
 
     pub fn lookup_type(&self, name: &ast::Ident) -> Result<&ast::TypeDef> {
-        if let Some((ty_def, _scope)) = self.types.get(name) {
-            Ok(ty_def)
-        } else {
-            Err(Error::UndefinedType(name.to_owned()))
+        for scope in self.scopes.iter().rev() {
+            if let Some(ty_def) = scope.types.get(name) {
+                return Ok(ty_def);
+            }
         }
+        Err(Error::UndefinedType(name.to_owned()))
     }
 
     pub fn lookup_var<'a, Q>(&'a self, name: &Q) -> Result<&'a ast::Type>
@@ -64,35 +78,58 @@ impl TyCx {
         ast::Ident: Borrow<Q>,
         Q: Into<ast::Ident> + Clone + Eq + Hash,
     {
-        self.variables
-            .get(name)
-            .map(|(ty, _)| ty)
+        self.scopes
+            .iter()
+            .rev()
+            .find_map(|scope| scope.variables.get(name))
             .ok_or_else(|| Error::UndefinedVar(name.clone().into()))
+    }
+
+    pub fn curr_scope(&self) -> &Scope {
+        self.scopes.last().unwrap()
+    }
+
+    pub fn curr_scope_mut(&mut self) -> &mut Scope {
+        self.scopes.last_mut().unwrap()
     }
 
     pub fn add_var(&mut self, name: &ast::Ident, ty: &ast::Type) -> Result<()> {
         self.check_type(ty)?;
-        self.variables
-            .insert(name.clone(), (ty.clone(), self.curr_scope));
+        self.curr_scope_mut()
+            .variables
+            .insert(name.clone(), ty.clone());
         Ok(())
     }
 
     pub fn add_type_def(&mut self, def: ast::TypeDef) {
-        self.types.insert(def.name.clone(), (def, self.curr_scope));
+        self.curr_scope_mut().types.insert(def.name.clone(), def);
+    }
+
+    pub fn cache_type(&mut self, id: ast::NodeId, ty: ast::Type) {
+        self.type_cache.insert(id, ty);
+    }
+
+    pub fn is_cached(&self, id: ast::NodeId) -> Option<&ast::Type> {
+        self.type_cache.get(&id)
     }
 
     pub fn check_expr(&mut self, expr: &ast::Expr) -> Result<ast::Type> {
-        match expr.kind.as_ref() {
-            ast::ExprKind::Fn(expr) => self.check_fn_expr(expr),
-            ast::ExprKind::Block(expr) => self.check_block_expr(expr),
-            ast::ExprKind::Cons(expr) => self.check_cons_expr(expr),
-            ast::ExprKind::Match(expr) => self.check_match_expr(expr),
-            ast::ExprKind::Call(expr) => self.check_call_expr(expr),
-            ast::ExprKind::Access(expr) => self.check_access_expr(expr),
-            ast::ExprKind::Ref(expr) => self.check_ref_expr(expr),
-            ast::ExprKind::Literal(expr) => self.check_literal_expr(expr),
-            ast::ExprKind::Bin(expr) => self.check_bin_expr(expr),
+        if let Some(cached) = self.is_cached(expr.id) {
+            return Ok(cached.to_owned());
         }
+        let ty = match expr.kind.as_ref() {
+            ast::ExprKind::Fn(expr) => self.check_fn_expr(expr)?,
+            ast::ExprKind::Block(expr) => self.check_block_expr(expr)?,
+            ast::ExprKind::Cons(expr) => self.check_cons_expr(expr)?,
+            ast::ExprKind::Match(expr) => self.check_match_expr(expr)?,
+            ast::ExprKind::Call(expr) => self.check_call_expr(expr)?,
+            ast::ExprKind::Access(expr) => self.check_access_expr(expr)?,
+            ast::ExprKind::Ref(expr) => self.check_ref_expr(expr)?,
+            ast::ExprKind::Literal(expr) => self.check_literal_expr(expr)?,
+            ast::ExprKind::Bin(expr) => self.check_bin_expr(expr)?,
+        };
+        self.cache_type(expr.id, ty.clone());
+        Ok(ty)
     }
 
     pub fn check_fn_expr(&mut self, expr: &ast::FnExpr) -> Result<ast::Type> {
@@ -145,29 +182,39 @@ impl TyCx {
     }
 
     pub fn check_cons_tag(&mut self, tag: &ast::ConsTag) -> Result<ast::Type> {
-        Ok(ast::Type::TagUnion(ast::TagUnionDef::singleton(
-            ast::TagDef {
-                name: tag.tag.clone(),
-                value: tag
-                    .value
-                    .as_ref()
-                    .map(|value| self.check_expr(value))
-                    .transpose()?
-                    .map(Box::new),
-            },
-        )))
+        let ty = self.type_of_tag(&tag.tag)?;
+        let val_ty = tag
+            .value
+            .as_ref()
+            .map(|value| self.check_expr(value))
+            .transpose()?;
+        let expected_val_ty = ty
+            .variants
+            .iter()
+            .find(|ty| ty.name == tag.tag)
+            .expect("`type_of_tag()` already checks the tag is in the type");
+        match (&expected_val_ty.value, &val_ty) {
+            (Some(expected), Some(ty)) => self.assert_same_type(expected, ty)?,
+            _ => return Err(Error::IncompatibleTag(tag.tag.clone(), ty.into())),
+        }
+        Ok(ty.into())
     }
 
     pub fn check_match_expr(&mut self, expr: &ast::MatchExpr) -> Result<ast::Type> {
+        // TODO: Check if the arm matches don't overlay and that they are non-exhaustive and valid (only tag union matches for tag union scrutinee, etc.)
         let scrutinee_ty = self.check_expr(&expr.scrutinee)?;
         let mut ty = None;
         for arm in &expr.arms {
-            let expr_ty = self.check_match_arm(&arm, &scrutinee_ty)?;
-            if let Some(ty) = ty.as_ref() {
-                self.assert_same_type(&expr_ty, ty)?;
-            } else {
-                ty.replace(expr_ty);
-            }
+            // Create a scope for each match arm
+            self.scope(|tcx| -> Result<()> {
+                let expr_ty = tcx.check_match_arm(&arm, &scrutinee_ty)?;
+                if let Some(ty) = ty.as_ref() {
+                    tcx.assert_same_type(&expr_ty, ty)?;
+                } else {
+                    ty.replace(expr_ty);
+                }
+                Ok(())
+            })?;
         }
         ty.ok_or_else(|| Error::EmptyMatch)
     }
@@ -260,7 +307,7 @@ impl TyCx {
     }
 
     /// Tries to get a type from a pattern. If the pattern is catchall, any type is valid, and so it returns `None`.
-    fn check_pattern(&self, patt: &ast::Pattern, expected: &ast::Type) -> Result<()> {
+    fn check_pattern(&mut self, patt: &ast::Pattern, expected: &ast::Type) -> Result<()> {
         match (patt, expected) {
             (ast::Pattern::Structure(patt), ast::Type::Structure(expected)) => {
                 self.check_structure_pattern(patt, expected)
@@ -282,7 +329,10 @@ impl TyCx {
                     )),
                 }
             }
-            (ast::Pattern::Catchall(_), _) => Ok(()),
+            (ast::Pattern::Catchall(binding), _) => {
+                self.add_var(binding, expected)?;
+                Ok(())
+            }
             (patt, expected) => Err(Error::IncompatiblePattern(
                 patt.to_owned(),
                 expected.to_owned(),
@@ -396,7 +446,7 @@ impl TyCx {
     pub fn check_type_ref(&self, ty_ref: &ast::TypeRef) -> Result<()> {
         // TODO: Check generics
         // TODO: Allow recursive types and refer to types before they are mentioned.
-        if !self.types.contains_key(&ty_ref.name) {
+        if !self.curr_scope().types.contains_key(&ty_ref.name) {
             if BuiltinType::from_name(&ty_ref.name.0).is_some() {
                 Ok(())
             } else {
@@ -469,6 +519,631 @@ impl TyCx {
     fn deref_type(&self, ty_ref: &ast::TypeRef) -> Result<ast::Type> {
         let ty_def = self.lookup_type(&ty_ref.name)?;
         Ok(ty_def.structural_type.as_ref().to_owned())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Function {
+    frame: Frame,
+    code: Vec<Instr>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Frame {
+    locals: Vec<ast::Ident>,
+}
+
+impl Frame {
+    pub fn new() -> Frame {
+        Frame { locals: Vec::new() }
+    }
+
+    pub fn lookup_local(&self, name: &ast::Ident) -> Option<usize> {
+        self.locals.iter().position(|local| local == name)
+    }
+
+    pub fn add_local(&mut self, name: ast::Ident) -> usize {
+        let idx = self.locals.len();
+        self.locals.push(name);
+        idx
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum Const {
+    String(String),
+    Num(f64),
+    Bool(bool),
+    Function(Function),
+}
+
+impl From<Function> for Const {
+    fn from(v: Function) -> Self {
+        Self::Function(v)
+    }
+}
+
+impl From<bool> for Const {
+    fn from(v: bool) -> Self {
+        Self::Bool(v)
+    }
+}
+
+impl From<f64> for Const {
+    fn from(v: f64) -> Self {
+        Self::Num(v)
+    }
+}
+
+impl From<String> for Const {
+    fn from(v: String) -> Self {
+        Self::String(v)
+    }
+}
+
+pub struct Codegen {
+    globals: HashMap<ast::Ident, usize>,
+    consts: Vec<Const>,
+    curr_frame: Frame,
+    next_label: usize,
+    tcx: TyCx,
+}
+
+impl Codegen {
+    pub fn type_size(&self, ty: &ast::Type) -> usize {
+        match ty {
+            ast::Type::Ref(_) => unreachable!("should be already resolved"),
+            // One word for the variant and enought space to fit the biggest variant inner type
+            ast::Type::TagUnion(tag) => {
+                1 + tag
+                    .variants
+                    .iter()
+                    .map(|variant| {
+                        variant
+                            .value
+                            .as_ref()
+                            .map(|ty| self.type_size(ty))
+                            .unwrap_or(0)
+                    })
+                    .max()
+                    .unwrap_or(0)
+            }
+            ast::Type::Structure(structure) => structure
+                .fields
+                .iter()
+                .map(|field| self.type_size(&field.ty))
+                .sum::<usize>(),
+            ast::Type::Fn(_) => 1,
+        }
+    }
+
+    pub fn label(&mut self) -> usize {
+        let lbl = self.next_label;
+        self.next_label += 1;
+        lbl
+    }
+
+    pub fn push_const(&mut self, c: impl Into<Const>) -> usize {
+        let idx = self.consts.len();
+        self.consts.push(c.into());
+        idx
+    }
+
+    pub fn codegen_expr(&mut self, expr: &ast::Expr, instrs: &mut Vec<Instr>) -> Result<()> {
+        match expr.kind.as_ref() {
+            ast::ExprKind::Fn(expr) => self.codegen_fn_expr(expr, instrs),
+            ast::ExprKind::Block(expr) => self.codegen_block_expr(expr, instrs),
+            ast::ExprKind::Cons(expr) => self.codegen_cons_expr(expr, instrs),
+            ast::ExprKind::Match(expr) => self.codegen_match_expr(expr, instrs),
+            ast::ExprKind::Call(expr) => self.codegen_call_expr(expr, instrs),
+            ast::ExprKind::Access(expr) => self.codegen_access_expr(expr, instrs),
+            ast::ExprKind::Ref(expr) => self.codegen_ref_expr(expr, instrs),
+            ast::ExprKind::Literal(expr) => self.codegen_literal(expr, instrs),
+            ast::ExprKind::Bin(expr) => self.codegen_bin_expr(expr, instrs),
+        }
+    }
+
+    pub fn codegen_fn_expr(&mut self, expr: &ast::FnExpr, instrs: &mut Vec<Instr>) -> Result<()> {
+        let mut code = Vec::new();
+
+        // Create a new frame and register the `arg` value as having index `0` in the function stack.
+        let mut frame = Frame::new();
+        let idx = frame.add_local(expr.arg.to_owned());
+
+        // This is a temporary placeholder, we'll overwrite it later
+        code.push(Instr::AllocLocals(0));
+
+        // Load the argument from the stack onto the function locals
+        code.push(Instr::StoreLocal(idx));
+
+        let prev_frame = std::mem::replace(&mut self.curr_frame, frame);
+        self.codegen_block_expr(&expr.body, &mut code)?;
+        let frame = std::mem::replace(&mut self.curr_frame, prev_frame);
+        resolve_labels(&mut code);
+
+        code[0] = Instr::AllocLocals(frame.locals.len());
+        let idx = self.push_const(Const::Function(Function { frame, code }));
+        instrs.push(Instr::LoadConst(idx));
+
+        Ok(())
+    }
+
+    pub fn codegen_block_expr(
+        &mut self,
+        expr: &ast::BlockExpr,
+        instrs: &mut Vec<Instr>,
+    ) -> Result<()> {
+        for stmt in &expr.stmts {
+            self.codegen_stmt(stmt, &mut *instrs)?;
+        }
+        Ok(())
+    }
+
+    fn codegen_stmt(&mut self, stmt: &ast::Stmt, instrs: &mut Vec<Instr>) -> Result<()> {
+        match stmt {
+            // No code is generated for type definitions
+            ast::Stmt::TypeDef(_) => Ok(()),
+            ast::Stmt::Expr(expr) => self.codegen_expr(expr, instrs),
+            ast::Stmt::Decl(decl) => {
+                let idx = self.curr_frame.add_local(decl.name.to_owned());
+                self.codegen_expr(&decl.value, &mut *instrs)?;
+                instrs.push(Instr::StoreLocal(idx));
+                Ok(())
+            }
+            ast::Stmt::Return(ret) => {
+                self.codegen_expr(&ret.expr, &mut *instrs)?;
+                instrs.push(Instr::Ret);
+                Ok(())
+            }
+        }
+    }
+
+    pub fn codegen_cons_expr(
+        &mut self,
+        expr: &ast::ConsExpr,
+        instrs: &mut Vec<Instr>,
+    ) -> Result<()> {
+        let ty = self.tcx.check_cons_expr(expr)?;
+        let size = self.type_size(&ty);
+        match expr {
+            ast::ConsExpr::ConsStructure(structure) => {
+                for field in &structure.fields {
+                    self.codegen_expr(&field.value, &mut *instrs)?;
+                }
+            }
+            ast::ConsExpr::ConsTag(tag) => {
+                let ty = self.tcx.type_of_tag(&tag.tag)?;
+                let idx = ty
+                    .variants
+                    .iter()
+                    .position(|var| var.name == tag.tag)
+                    .unwrap();
+                // Push the tag
+                instrs.push(Instr::Idx(LinkValue::Value(idx)));
+                if let Some(expr) = tag.value.as_ref() {
+                    self.codegen_expr(expr, instrs)?;
+                }
+            }
+        }
+        instrs.push(Instr::BuildType(size));
+        Ok(())
+    }
+
+    pub fn codegen_match_expr(
+        &mut self,
+        expr: &ast::MatchExpr,
+        instrs: &mut Vec<Instr>,
+    ) -> Result<()> {
+        self.codegen_expr(&expr.scrutinee, &mut *instrs)?;
+        let ty = self.tcx.check_expr(&expr.scrutinee)?;
+        match ty {
+            ast::Type::Fn(_) => todo!("this should be an error"),
+            ast::Type::Ref(ty_ref) => {
+                if let Some(ty) = BuiltinType::from_name(&ty_ref.name.0) {
+                    let mut labels = Vec::new();
+                    match ty {
+                        BuiltinType::String => todo!(),
+                        BuiltinType::Unit => todo!(),
+                        BuiltinType::Number => {
+                            for arm in &expr.arms {
+                                match &arm.pattern {
+                                    ast::Pattern::Structure(_) | ast::Pattern::Tag(_) => {
+                                        todo!("error")
+                                    }
+                                    ast::Pattern::Literal(lit) => {
+                                        let &ast::Literal::Number(num) = lit else {
+                                            todo!();
+                                        };
+                                        instrs.push(Instr::LoadConst(
+                                            self.push_const(Const::Num(num)),
+                                        ));
+                                        instrs.push(Instr::EqualNum);
+                                        let lbl = self.label();
+                                        labels.push(lbl);
+                                        instrs.push(Instr::BranchIfTrue(LinkValue::Ref(lbl)));
+                                    }
+                                    ast::Pattern::Catchall(ident) => {
+                                        let lbl = self.label();
+                                        labels.push(lbl);
+                                        let binding = self.curr_frame.add_local(ident.to_owned());
+                                        instrs.push(Instr::StoreLocal(binding));
+                                        instrs.push(Instr::Jump(LinkValue::Ref(lbl)));
+                                    }
+                                }
+                            }
+                        }
+                        BuiltinType::Bool => todo!(),
+                    }
+                    for (arm, lbl) in expr.arms.iter().zip(labels) {
+                        instrs.push(Instr::Label(lbl));
+                        self.codegen_expr(&arm.expr, instrs)?;
+                    }
+                } else {
+                    todo!()
+                }
+            }
+            ast::Type::TagUnion(tags) => {
+                let labels = (0..tags.variants.len())
+                    .map(|_| self.label())
+                    .collect::<Vec<_>>();
+                instrs.extend(
+                    labels
+                        .iter()
+                        .copied()
+                        .map(|lbl| Instr::Idx(LinkValue::Ref(lbl))),
+                );
+                instrs.push(Instr::Branch(tags.variants.len()));
+                // Should have one arm for each tag
+                for (tag, lbl) in tags.variants.iter().zip(labels) {
+                    let arm = expr
+                        .arms
+                        .iter()
+                        .find(|arm| match &arm.pattern {
+                            ast::Pattern::Structure(_) | ast::Pattern::Literal(_) => unreachable!(),
+                            ast::Pattern::Tag(pat) => pat.name == tag.name,
+                            ast::Pattern::Catchall(_) => true,
+                        })
+                        .ok_or_else(|| Error::NonExhaustiveMatch(tag.name.to_owned()))?;
+                    instrs.push(Instr::Label(lbl));
+                    self.codegen_expr(&arm.expr, &mut *instrs)?;
+                }
+            }
+            ast::Type::Structure(_) => todo!(),
+        }
+        Ok(())
+    }
+
+    pub fn codegen_call_expr(
+        &mut self,
+        expr: &ast::CallExpr,
+        instrs: &mut Vec<Instr>,
+    ) -> Result<()> {
+        self.codegen_expr(&expr.arg, &mut *instrs)?;
+        self.codegen_expr(&expr.callee, &mut *instrs)?;
+        instrs.push(Instr::Call);
+        Ok(())
+    }
+
+    pub fn codegen_access_expr(
+        &mut self,
+        expr: &ast::AccessExpr,
+        instrs: &mut Vec<Instr>,
+    ) -> Result<()> {
+        let ty = self.tcx.check_expr(&expr.value)?;
+        let ast::Type::Structure(structure) = ty else {
+            return Err(Error::ExpectedStructure(ty));
+        };
+        let idx = structure
+            .fields
+            .iter()
+            .position(|field| field.field == expr.field)
+            .expect("type checking should catch this");
+        instrs.push(Instr::ReadField(idx));
+        Ok(())
+    }
+
+    pub fn codegen_ref_expr(&self, expr: &ast::RefExpr, instrs: &mut Vec<Instr>) -> Result<()> {
+        dbg!(&self.curr_frame);
+        let idx = self
+            .curr_frame
+            .lookup_local(dbg!(&expr.ident))
+            .expect("type checking should catch this");
+        instrs.push(Instr::LoadLocal(idx));
+        Ok(())
+    }
+
+    pub fn codegen_literal(&mut self, lit: &ast::Literal, instrs: &mut Vec<Instr>) -> Result<()> {
+        match lit {
+            ast::Literal::String(s) => instrs.push(Instr::LoadConst(
+                self.push_const(Const::String(s.to_owned())),
+            )),
+            &ast::Literal::Number(n) => instrs.push(Instr::LoadConst(self.push_const(n))),
+            &ast::Literal::Bool(b) => instrs.push(Instr::LoadConst(self.push_const(b))),
+        }
+        Ok(())
+    }
+
+    pub fn codegen_bin_expr(&mut self, expr: &ast::BinExpr, instrs: &mut Vec<Instr>) -> Result<()> {
+        let ty = BuiltinType::try_from(self.tcx.check_bin_expr(expr)?)?;
+        self.codegen_expr(&expr.lhs, &mut *instrs)?;
+        self.codegen_expr(&expr.rhs, &mut *instrs)?;
+        match (&expr.op, ty) {
+            /* Arithmetic operations */
+            (ast::BinOp::Add, BuiltinType::Number) => instrs.push(Instr::Add),
+            (ast::BinOp::Sub, BuiltinType::Number) => instrs.push(Instr::Sub),
+            (ast::BinOp::Mul, BuiltinType::Number) => instrs.push(Instr::Mul),
+            (ast::BinOp::Div, BuiltinType::Number) => instrs.push(Instr::Div),
+            (ast::BinOp::Mod, BuiltinType::Number) => instrs.push(Instr::Mod),
+
+            /* Bit operations */
+            (ast::BinOp::BitAnd, BuiltinType::Number) => instrs.push(Instr::BitAnd),
+            (ast::BinOp::BitOr, BuiltinType::Number) => instrs.push(Instr::BitOr),
+            (ast::BinOp::ShiftLeft, BuiltinType::Number) => instrs.push(Instr::ShiftLeft),
+            (ast::BinOp::ShiftRight, BuiltinType::Number) => instrs.push(Instr::ShiftRight),
+
+            /* Logical boolean operations */
+            (ast::BinOp::And, BuiltinType::Bool) => instrs.push(Instr::And),
+            (ast::BinOp::Or, BuiltinType::Bool) => instrs.push(Instr::Or),
+
+            /* Comparison for numbers */
+            (ast::BinOp::Less, BuiltinType::Number) => instrs.push(Instr::LessNum),
+            (ast::BinOp::LessEqual, BuiltinType::Number) => instrs.push(Instr::LessEqualNum),
+            (ast::BinOp::Greater, BuiltinType::Number) => instrs.push(Instr::GreaterNum),
+            (ast::BinOp::GreaterEqual, BuiltinType::Number) => instrs.push(Instr::GreaterEqualNum),
+            (ast::BinOp::Equal, BuiltinType::Number) => instrs.push(Instr::EqualNum),
+            (ast::BinOp::NotEqual, BuiltinType::Number) => {
+                instrs.push(Instr::EqualNum);
+                instrs.push(Instr::Not);
+            }
+
+            /* Comparison for strings */
+            (ast::BinOp::LessEqual, BuiltinType::String) => instrs.push(Instr::LessEqualStr),
+            (ast::BinOp::Greater, BuiltinType::String) => instrs.push(Instr::GreaterStr),
+            (ast::BinOp::GreaterEqual, BuiltinType::String) => instrs.push(Instr::GreaterEqualStr),
+            (ast::BinOp::Equal, BuiltinType::String) => instrs.push(Instr::EqualStr),
+            (ast::BinOp::NotEqual, BuiltinType::String) => {
+                instrs.push(Instr::EqualStr);
+                instrs.push(Instr::Not);
+            }
+
+            /* Catchall */
+            _ => unreachable!("type checking should have cought this case"),
+        }
+        Ok(())
+    }
+
+    pub fn write_binary<W: std::io::Write>(
+        &self,
+        top_level: &[Instr],
+        mut w: W,
+    ) -> std::io::Result<()> {
+        write_instructions_bin(top_level, &mut w)?;
+        Ok(())
+    }
+}
+
+pub fn resolve_labels(instrs: &mut Vec<Instr>) {
+    let labels = instrs
+        .iter()
+        .enumerate()
+        .filter_map(|(i, instr)| {
+            if let &Instr::Label(l) = instr {
+                Some((l, i))
+            } else {
+                None
+            }
+        })
+        .collect::<HashMap<_, _>>();
+    let mut i = 0;
+    for j in 0..instrs.len() {
+        instrs.swap(i, j);
+        match &instrs[j] {
+            // Skip
+            Instr::Label(_) => (),
+            Instr::Idx(LinkValue::Ref(idx)) => {
+                instrs[i] = Instr::Idx(LinkValue::Value(labels[idx]))
+            }
+            _ => i += 1,
+        }
+    }
+    instrs.truncate(i);
+}
+
+pub fn write_instructions_text<W: std::io::Write>(
+    instrs: &[Instr],
+    mut w: W,
+) -> std::io::Result<()> {
+    use Instr::*;
+
+    for instr in instrs {
+        match instr {
+            StoreLocal(arg) => writeln!(w, "STORE_LOCAL {arg}")?,
+            LoadLocal(arg) => writeln!(w, "LOAD_LOCAL {arg}")?,
+            LoadConst(arg) => writeln!(w, "LOAD_CONST {arg}")?,
+            ReadField(arg) => writeln!(w, "READ_FIELD {arg}")?,
+            BuildType(arg) => writeln!(w, "BUILD_TYPE {arg}")?,
+            AllocLocals(arg) => writeln!(w, "ALLOC_LOCALS {arg}")?,
+            Ret => writeln!(w, "RETURN")?,
+            Call => writeln!(w, "CALL")?,
+            Branch(arg) => writeln!(w, "BRANCH {arg}")?,
+            BranchIfTrue(arg) => writeln!(w, "BRANCH_IF_TRU {}", arg.as_value().unwrap())?,
+            Jump(arg) => writeln!(w, "JUMP {}", arg.as_value().unwrap())?,
+            Add => writeln!(w, "ADD")?,
+            Sub => writeln!(w, "SUB")?,
+            Mul => writeln!(w, "MUL")?,
+            Div => writeln!(w, "DIV")?,
+            Mod => writeln!(w, "MOD")?,
+            And => writeln!(w, "AND")?,
+            Or => writeln!(w, "OR")?,
+            Not => writeln!(w, "NOT")?,
+            BitAnd => writeln!(w, "BIT_AND")?,
+            BitOr => writeln!(w, "BIT_OR")?,
+            ShiftLeft => writeln!(w, "SHIFT_LEFT")?,
+            ShiftRight => writeln!(w, "SHIFT_RIGHT")?,
+            LessNum => writeln!(w, "LESS_NUM")?,
+            LessEqualNum => writeln!(w, "LESS_EQUAL_NUM")?,
+            GreaterNum => writeln!(w, "GREATER_NUM")?,
+            GreaterEqualNum => writeln!(w, "GREATER_EQUAL_NUM")?,
+            EqualNum => writeln!(w, "EQUAL_NUM")?,
+            LessStr => writeln!(w, "LESS_STR")?,
+            LessEqualStr => writeln!(w, "LESS_EQUAL_STR")?,
+            GreaterStr => writeln!(w, "GREATER_STR")?,
+            GreaterEqualStr => writeln!(w, "GREATER_EQUAL_STR")?,
+            EqualStr => writeln!(w, "EQUAL_STR")?,
+            Label(_) => panic!("instructions don't have all labels resolved"),
+            Idx(arg) => writeln!(w, "psh {}", arg.as_value().unwrap())?,
+        }
+    }
+    Ok(())
+}
+
+pub fn write_instructions_bin<W: std::io::Write>(
+    instrs: &[Instr],
+    mut w: W,
+) -> std::io::Result<()> {
+    use Instr::*;
+
+    for instr in instrs {}
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum LinkValue {
+    Value(usize),
+    Ref(usize),
+}
+
+impl LinkValue {
+    pub fn as_value(&self) -> Option<&usize> {
+        if let Self::Value(v) = self {
+            Some(v)
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+#[repr(u8)]
+pub enum Instr {
+    /* Read write operations */
+    /// Operation: `locals[$0] = pop()`
+    StoreLocal(usize),
+    /// Operation: `push(locals[$0])`
+    LoadLocal(usize),
+    /// Operation: `push(consts[$0])`
+    LoadConst(usize),
+    /// Operation: `push(((void**)pop())[$0])`
+    ReadField(usize),
+
+    /* Allocation operations */
+    /// Operation:
+    /// ```c
+    /// void** obj = malloc($0 * sizeof(void*));
+    /// for (int i = 0; i < $0; i++)
+    ///     obj[i] = pop();
+    /// push(obj);
+    /// ```
+    BuildType(usize),
+    AllocLocals(usize),
+
+    /* Control flow operations */
+    Ret,
+    Call,
+    /// Operation:
+    /// ```c
+    /// int idx = pop();
+    /// ip = top[-idx];
+    /// discard($0);
+    /// ```
+    Branch(usize),
+    BranchIfTrue(LinkValue),
+    Jump(LinkValue),
+    // Arithmetic operations
+    /// Operation: `push(pop() + pop())`
+    Add,
+    /// Operation: `push(pop() - pop())`
+    Sub,
+    /// Operation: `push(pop() * pop())`
+    Mul,
+    /// Operation: `push(pop() / pop())`
+    Div,
+    /// Operation: `push(pop() % pop())`
+    Mod,
+    // Boolean operations
+    /// Operation: `push(pop() && pop())`
+    And,
+    /// Operation: `push(pop() || pop())`
+    Or,
+    /// Operation: `push(!pop())`
+    Not,
+    // Bitwise operations
+    /// Operation: `push(pop() & pop())`
+    BitAnd,
+    /// Operation: `push(pop() | pop())`
+    BitOr,
+    /// Operation: `push(pop() << pop())`
+    ShiftLeft,
+    /// Operation: `push(pop() >> pop())`
+    ShiftRight,
+    // Numeric comparisons
+    /// Operation: `push(pop() < pop())`
+    LessNum,
+    /// Operation: `push(pop() <= pop())`
+    LessEqualNum,
+    /// Operation: `push(pop() > pop())`
+    GreaterNum,
+    /// Operation: `push(pop() >= pop())`
+    GreaterEqualNum,
+    /// Operation: `push(pop() == pop())`
+    EqualNum,
+    // String comparisons
+    /// Operation: `push(strcmp(pop(), pop()) < 0)`
+    LessStr,
+    /// Operation: `push(strcmp(pop(), pop()) <= 0)`
+    LessEqualStr,
+    /// Operation: `push(strcmp(pop(), pop()) > 0)`
+    GreaterStr,
+    /// Operation: `push(strcmp(pop(), pop()) >= 0)`
+    GreaterEqualStr,
+    /// Operation: `push(strcmp(pop(), pop()) == 0)`
+    EqualStr,
+    Label(usize),
+    /// Operation: `push($0)`
+    Idx(LinkValue),
+}
+
+impl Instr {
+    pub fn op(&self) -> u8 {
+        // SAFETY: https://doc.rust-lang.org/std/mem/fn.discriminant.html
+        unsafe { *<*const _>::from(self).cast::<u8>() }
+    }
+
+    pub fn arg(&self) -> u8 {
+        use Instr::*;
+
+        match self {
+            /* Instructions with argument */
+            &StoreLocal(arg)
+            | &LoadLocal(arg)
+            | &LoadConst(arg)
+            | &ReadField(arg)
+            | &BuildType(arg)
+            | &AllocLocals(arg)
+            | &Branch(arg)
+            | &BranchIfTrue(LinkValue::Value(arg))
+            | &Jump(LinkValue::Value(arg))
+            | &Idx(LinkValue::Value(arg)) => arg as u8,
+            /* Instructions without arguments */
+            Ret | Call | Add | Sub | Mul | Div | Mod | And | Or | Not | BitAnd | BitOr
+            | ShiftLeft | ShiftRight | LessNum | LessEqualNum | GreaterNum | GreaterEqualNum
+            | EqualNum | LessStr | LessEqualStr | GreaterStr | GreaterEqualStr | EqualStr => 0,
+            /* Errors */
+            BranchIfTrue(LinkValue::Ref(_))
+            | Jump(LinkValue::Ref(_))
+            | Label(_)
+            | Idx(LinkValue::Ref(_)) => panic!("all labels must be resolved"),
+        }
     }
 }
 
@@ -558,29 +1233,34 @@ pub enum Error {
 
     /// # Example
     ///
-    /// ```ignore
+    /// ```txt
     /// if ({ a: "hello" }) is {
     ///     { b } => print(b),
     /// }
     /// ```
     IncompatiblePattern(ast::Pattern, ast::Type),
+
+    TagNotFound(ast::Ident),
+    IncompatibleTag(ast::Ident, ast::Type),
+    NonExhaustiveMatch(ast::Ident),
+    ExpectedStructure(ast::Type),
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
 
+    // ```
+    //  1 | const fib: Number -> Number = fn n : Number -> Number {
+    //  2 |     return if n is {
+    //  3 |         0 => 1,
+    //  4 |         1 => 1,
+    //  5 |         n1 => fib (n1-1) + fib (n1-2),
+    //  6 |     };
+    //  7 | }
+    // ```
     #[test]
     pub fn fib() {
-        // ```
-        //  1 | const fib: Number -> Number = fn n : Number -> Number {
-        //  2 |     return if n is {
-        //  3 |         0 => 1,
-        //  4 |         1 => 1,
-        //  5 |         n => fib (n-1) + fib (n-2),
-        //  6 |     };
-        //  7 | }
-        // ```
         let code = {
             use ast::*;
 
@@ -604,7 +1284,7 @@ mod test {
                                     lhs: Expr {
                                         id: 12.into(),
                                         kind: Box::new(ExprKind::Ref(RefExpr {
-                                            ident: "n".into(),
+                                            ident: "n1".into(),
                                         })),
                                     },
                                     rhs: Expr {
@@ -631,7 +1311,7 @@ mod test {
                                     lhs: Expr {
                                         id: 17.into(),
                                         kind: Box::new(ExprKind::Ref(RefExpr {
-                                            ident: "n".into(),
+                                            ident: "n1".into(),
                                         })),
                                     },
                                     rhs: Expr {
@@ -693,7 +1373,7 @@ mod test {
                                                 },
                                             },
                                             MatchArm {
-                                                pattern: Pattern::Catchall("n".into()),
+                                                pattern: Pattern::Catchall("n1".into()),
                                                 expr: line_5,
                                             },
                                         ]
@@ -711,5 +1391,114 @@ mod test {
         let mut tcx = TyCx::new();
         let res = tcx.check_stmt(&code);
         assert!(res.is_ok(), "{res:?}");
+
+        let mut codegen = Codegen {
+            globals: HashMap::new(),
+            consts: Vec::new(),
+            curr_frame: Frame::new(),
+            next_label: 0,
+            tcx,
+        };
+        let mut instrs = Vec::new();
+        let res = codegen.codegen_stmt(&code, &mut instrs);
+        assert!(res.is_ok(), "{res:?}");
+        resolve_labels(&mut instrs);
+        dbg!(instrs);
+        for c in &codegen.consts {
+            dbg!(c);
+        }
+    }
+
+    // ```
+    //  1 | const add1: Number -> Number = fn n : Number -> Number {
+    //  2 |     return n + 1;
+    //  7 | }
+    // ```
+    #[test]
+    pub fn add1() {
+        let code = {
+            use ast::*;
+
+            Stmt::Decl(Decl {
+                is_const: true,
+                ty: Box::new(Type::Fn(FnType {
+                    argument: Box::new(Type::number()),
+                    ret: Box::new(Type::number()),
+                })),
+                name: "add1".into(),
+                value: Expr {
+                    id: 1.into(),
+                    kind: Box::new(ExprKind::Fn(FnExpr {
+                        id: 2.into(),
+                        arg: "n".into(),
+                        ty: FnType {
+                            argument: Box::new(Type::number()),
+                            ret: Box::new(Type::number()),
+                        },
+                        body: BlockExpr {
+                            id: 3.into(),
+                            stmts: [Stmt::Return(ReturnStmt {
+                                expr: Expr {
+                                    id: 4.into(),
+                                    kind: Box::new(ExprKind::Bin(BinExpr {
+                                        op: BinOp::Add,
+                                        lhs: Expr {
+                                            id: 5.into(),
+                                            kind: Box::new(ExprKind::Ref(RefExpr {
+                                                ident: "n".into(),
+                                            })),
+                                        },
+                                        rhs: Expr {
+                                            id: 6.into(),
+                                            kind: Box::new(ExprKind::Literal(Literal::Number(1.0))),
+                                        },
+                                    })),
+                                },
+                            })]
+                            .to_vec(),
+                        },
+                    })),
+                },
+            })
+        };
+
+        let mut tcx = TyCx::new();
+        let res = tcx.check_stmt(&code);
+        assert!(res.is_ok(), "{res:?}");
+
+        let mut codegen = Codegen {
+            globals: HashMap::new(),
+            consts: Vec::new(),
+            curr_frame: Frame::new(),
+            next_label: 0,
+            tcx,
+        };
+        let mut instrs = Vec::new();
+        let res = codegen.codegen_stmt(&code, &mut instrs);
+        assert!(res.is_ok(), "{res:?}");
+        resolve_labels(&mut instrs);
+        dbg!(&instrs);
+        for c in &codegen.consts {
+            dbg!(c);
+        }
+        {
+            use std::io::Write;
+
+            let mut writer = Vec::new();
+            write_instructions_text(&instrs, &mut writer).unwrap();
+            writeln!(writer, "\n--- CONSTS ---").unwrap();
+            for (i, c) in codegen.consts.iter().enumerate() {
+                writeln!(writer, "\n= CONST {i} =").unwrap();
+                match c {
+                    Const::String(s) => writeln!(writer, "STR \"{s}\""),
+                    Const::Function(func) => write_instructions_text(&func.code, &mut writer),
+                    Const::Num(n) => writeln!(writer, "NUM {n}"),
+                    Const::Bool(b) => writeln!(writer, "BOOL {b}"),
+                }
+                .unwrap()
+            }
+            let s = String::from_utf8(writer).unwrap();
+            println!("{s}");
+        }
     }
 }
