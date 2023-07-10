@@ -4,14 +4,15 @@
 
 ```bnf
 <prog> ::= <stmt>*
-<stmt> ::= <type_def> | <decl> | <expr> ";"
+<stmt> ::= <type_def> | <decl> | <expr> ";" | <return_stmt>
+
+<return_stmt> ::= "return" <expr> ";"
 
 # Expressions
-<expr> ::= <fn_expr> | <block> | <cons_expr> | <match_expr> | <return_expr>
+<expr> ::= <fn_expr> | <block> | <cons_expr> | <match_expr> | <call_expr> | <access_expr> | <ref_expr> | <lit_expr> | <bin_expr>
 <fn_expr> ::= "fn" <ident> ":" <fn_type> <block>
 <fn_type> ::= <type> "->" <type>
 <block> ::= "{" <stmt>* "}"
-<return_expr> ::= "return" <expr>
 <match_expr> ::= "if" <expr> "is" <match_arm>*
 <match_arm> ::= <pattern> "=>" <expr>
 <cons_expr> ::= <cons_structure> | <cons_tag>
@@ -22,6 +23,11 @@
 <cons_field> ::= <ident> <cons_field_rename>?
 <cons_field_rename> ::= ":" <ident>
 <tag_pattern> ::= <ident> <pattern>?
+<call_expr> ::= <expr> "(" <expr> ")"
+<access_expr> ::= <expr> "." <ident>
+<ref_expr> ::= <ident>
+<bin_expr> ::= <expr> <bin_op> <expr>
+<bin_op> ::= "+" | "-" | "*" | "/" | "%" | "and" | "or" | "&" | "|" | "<<" | ">>" | "<" | "<=" | ">" | ">=" | "==" | "!="
 
 # Patterns
 <pattern> ::= <structure_pattern> | <tag_pattern>
